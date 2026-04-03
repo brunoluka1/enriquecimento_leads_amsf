@@ -1,7 +1,7 @@
 import os
 import json
+import asyncio
 import logging
-from contextlib import asynccontextmanager
 
 import httpx
 import anthropic
@@ -14,11 +14,13 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-APOLLO_API_KEY = os.getenv("APOLLO_API_KEY")
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")
+
+APIFY_BASE = "https://api.apify.com/v2"
 
 
 # ── Modelos ──────────────────────────────────────────────────────────────────
@@ -26,55 +28,109 @@ PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")
 class EnrichRequest(BaseModel):
     email: str | None = None
     phone: str | None = None
+    name: str | None = None
+    company: str | None = None
 
 
-# ── Apollo ───────────────────────────────────────────────────────────────────
+# ── Apify ────────────────────────────────────────────────────────────────────
 
-async def apollo_match_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> dict | None:
-    """Busca pessoa no Apollo pelo email ou telefone."""
-    payload = {"per_page": 1, "page": 1}
-    if email:
-        payload["q_keywords"] = email
-    if phone:
-        payload["q_keywords"] = phone
+async def apify_run_actor(client: httpx.AsyncClient, actor_id: str, run_input: dict) -> list | None:
+    """Executa um Actor na Apify e aguarda o resultado."""
+    # Iniciar o actor
     resp = await client.post(
-        "https://api.apollo.io/v1/mixed_people/search",
-        headers={"Content-Type": "application/json", "x-api-key": APOLLO_API_KEY},
-        json=payload,
+        f"{APIFY_BASE}/acts/{actor_id}/runs",
+        headers={"Authorization": f"Bearer {APIFY_API_TOKEN}", "Content-Type": "application/json"},
+        json=run_input,
+        timeout=30,
     )
-    logger.info("Apollo person search status=%s response=%s", resp.status_code, resp.text[:1000])
-    if resp.status_code != 200:
+    logger.info("Apify start actor=%s status=%s", actor_id, resp.status_code)
+    if resp.status_code not in (200, 201):
+        logger.warning("Apify start falhou: %s", resp.text[:500])
         return None
-    people = resp.json().get("people", [])
-    if not people:
+
+    run_data = resp.json().get("data", {})
+    run_id = run_data.get("id")
+    if not run_id:
         return None
-    return people[0]
 
+    # Aguardar conclusão (polling)
+    for _ in range(60):
+        await asyncio.sleep(5)
+        status_resp = await client.get(
+            f"{APIFY_BASE}/actor-runs/{run_id}",
+            headers={"Authorization": f"Bearer {APIFY_API_TOKEN}"},
+            timeout=15,
+        )
+        if status_resp.status_code != 200:
+            continue
+        status = status_resp.json().get("data", {}).get("status")
+        logger.info("Apify run=%s status=%s", run_id, status)
+        if status == "SUCCEEDED":
+            break
+        if status in ("FAILED", "ABORTED", "TIMED-OUT"):
+            logger.warning("Apify run falhou com status: %s", status)
+            return None
+    else:
+        logger.warning("Apify run timeout após 5 minutos")
+        return None
 
-async def apollo_enrich_org(client: httpx.AsyncClient, domain: str) -> dict | None:
-    """Enriquece organização pelo domínio."""
-    resp = await client.get(
-        "https://api.apollo.io/v1/organizations/enrich",
-        headers={"x-api-key": APOLLO_API_KEY},
-        params={"domain": domain},
+    # Buscar resultados do dataset
+    dataset_id = status_resp.json().get("data", {}).get("defaultDatasetId")
+    if not dataset_id:
+        return None
+
+    items_resp = await client.get(
+        f"{APIFY_BASE}/datasets/{dataset_id}/items",
+        headers={"Authorization": f"Bearer {APIFY_API_TOKEN}"},
+        timeout=30,
     )
-    if resp.status_code != 200:
-        logger.warning("Apollo org enrich falhou: %s", resp.text)
+    if items_resp.status_code != 200:
         return None
-    return resp.json().get("organization")
+    return items_resp.json()
 
 
-async def apollo_search_people(client: httpx.AsyncClient, org_id: str) -> list:
-    """Busca funcionários da organização."""
-    resp = await client.post(
-        "https://api.apollo.io/v1/mixed_people/search",
-        headers={"Content-Type": "application/json", "x-api-key": APOLLO_API_KEY},
-        json={"organization_ids": [org_id], "per_page": 100, "page": 1},
-    )
-    if resp.status_code != 200:
-        logger.warning("Apollo people search falhou: %s", resp.text)
-        return []
-    return resp.json().get("people", [])
+async def apify_google_search(client: httpx.AsyncClient, query: str) -> str | None:
+    """Busca no Google via Apify para encontrar o LinkedIn da pessoa."""
+    results = await apify_run_actor(client, "apify~google-search-scraper", {
+        "queries": query,
+        "maxPagesPerQuery": 1,
+        "resultsPerPage": 5,
+        "languageCode": "pt-br",
+    })
+    if not results:
+        return None
+
+    # Procurar URL do LinkedIn nos resultados
+    for result in results:
+        organic = result.get("organicResults", [])
+        for item in organic:
+            url = item.get("url", "")
+            if "linkedin.com/in/" in url:
+                logger.info("LinkedIn encontrado via Google: %s", url)
+                return url
+    return None
+
+
+async def apify_linkedin_profile(client: httpx.AsyncClient, linkedin_url: str) -> dict | None:
+    """Scrape do perfil LinkedIn via Apify."""
+    results = await apify_run_actor(client, "anchor~linkedin-profile-scraper", {
+        "profileUrls": [linkedin_url],
+    })
+    if not results or len(results) == 0:
+        return None
+    logger.info("LinkedIn profile scraped: %s", results[0].get("fullName", "N/A"))
+    return results[0]
+
+
+async def apify_linkedin_company(client: httpx.AsyncClient, company_url: str) -> dict | None:
+    """Scrape da página da empresa no LinkedIn via Apify."""
+    results = await apify_run_actor(client, "anchor~linkedin-company-scraper", {
+        "companyUrls": [company_url],
+    })
+    if not results or len(results) == 0:
+        return None
+    logger.info("LinkedIn company scraped: %s", results[0].get("name", "N/A"))
+    return results[0]
 
 
 # ── Firecrawl ────────────────────────────────────────────────────────────────
@@ -173,42 +229,50 @@ Foque em informações dos últimos 90 dias. Priorize fontes jornalísticas, rel
 # ── Claude (Anthropic) ──────────────────────────────────────────────────────
 
 async def claude_generate_summary(
-    person: dict,
-    organization: dict | None,
-    employees: list,
+    person: dict | None,
+    company: dict | None,
     website_content: str | None,
     market_research: str | None,
 ) -> str | None:
     """Gera resumo de enriquecimento do lead usando Claude."""
-    employees_text = ""
-    for i, emp in enumerate(employees[:20], 1):
-        name = emp.get("name", "N/A")
-        title = emp.get("title", "N/A")
-        employees_text += f"{i}. {name} — {title}\n"
 
-    prompt = f"""You are a B2B sales intelligence assistant. Analyze the following lead data from Apollo and the company website content scraped by Firecrawl, then generate a concise lead enrichment summary for the CRM.
+    # Dados da pessoa (do LinkedIn via Apify)
+    person_text = "Não disponível"
+    if person:
+        person_text = f"""Nome: {person.get('fullName', 'N/A')}
+LinkedIn: {person.get('linkedInUrl', 'N/A')}
+Cargo: {person.get('title', 'N/A')}
+Headline: {person.get('headline', 'N/A')}
+Localização: {person.get('location', 'N/A')}
+Resumo: {person.get('summary', 'N/A')}"""
 
-## Lead Data from Apollo:
-{person.get('name', 'N/A')}
-{person.get('linkedin_url', 'N/A')}
-{person.get('title', 'N/A')}
-{person.get('headline', 'N/A')}
-{person.get('city', '')} {person.get('state', '')}
-{person.get('email', 'N/A')}
-{person.get('seniority', 'N/A')}
+    # Dados da empresa (do LinkedIn via Apify)
+    company_text = "Não disponível"
+    if company:
+        company_text = f"""Nome: {company.get('name', 'N/A')}
+Website: {company.get('website', 'N/A')}
+Setor: {company.get('industry', 'N/A')}
+Tamanho: {company.get('employeeCount', 'N/A')} funcionários
+Localização: {company.get('headquarters', 'N/A')}
+Descrição: {company.get('description', 'N/A')[:1000]}"""
 
-## Company Information
-{organization.get('name', 'N/A') if organization else 'N/A'}
-{organization.get('website_url', 'N/A') if organization else 'N/A'}
-{organization.get('city', 'N/A') if organization else 'N/A'}
-{organization.get('state', 'N/A') if organization else 'N/A'}
-Total employees found: {len(employees)}
+        # Funcionários-chave
+        employees = company.get("employees", [])
+        if employees:
+            company_text += "\n\nFuncionários-chave:"
+            for i, emp in enumerate(employees[:20], 1):
+                company_text += f"\n{i}. {emp.get('name', 'N/A')} — {emp.get('title', 'N/A')}"
 
-## Company Website Content (scraped by Firecrawl):
+    prompt = f"""You are a B2B sales intelligence assistant. Analyze the following lead data and generate a concise lead enrichment summary for the CRM.
+
+## Lead Data (LinkedIn):
+{person_text}
+
+## Company Information (LinkedIn):
+{company_text}
+
+## Company Website Content (Firecrawl):
 {(website_content or 'Não disponível')[:5000]}
-
-## Employees Information:
-{employees_text or 'Não disponível'}
 
 ## Market Research (Perplexity):
 {market_research or 'Não disponível'}
@@ -233,8 +297,8 @@ Toda a resposta em português."""
 PIPEDRIVE_BASE = "https://api.pipedrive.com/v1"
 
 
-async def pipedrive_find_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> int | None:
-    """Busca pessoa no Pipedrive pelo email ou telefone."""
+async def pipedrive_find_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> tuple[int | None, dict | None]:
+    """Busca pessoa no Pipedrive pelo email ou telefone. Retorna (id, dados)."""
     term = email or phone
     field = "email" if email else "phone"
     resp = await client.get(
@@ -249,13 +313,14 @@ async def pipedrive_find_person(client: httpx.AsyncClient, email: str | None = N
     )
     if resp.status_code != 200:
         logger.warning("Pipedrive search falhou: %s", resp.text)
-        return None
+        return None, None
     data = resp.json().get("data", {})
     items = data.get("items", [])
     if not items:
         logger.warning("Pessoa não encontrada no Pipedrive: %s", term)
-        return None
-    return items[0].get("item", {}).get("id")
+        return None, None
+    item = items[0].get("item", {})
+    return item.get("id"), item
 
 
 async def pipedrive_create_note(client: httpx.AsyncClient, person_id: int, content: str) -> bool:
@@ -281,77 +346,79 @@ async def enrich_lead(email: str | None = None, phone: str | None = None) -> dic
     result = {"email": email, "phone": phone, "status": "processing", "steps": {}}
 
     async with httpx.AsyncClient(timeout=60) as client:
-        # 1. Apollo — buscar pessoa
-        person = await apollo_match_person(client, email=email, phone=phone)
-        if not person:
+
+        # 1. Pipedrive — buscar pessoa para pegar nome e empresa
+        person_id, pipedrive_person = await pipedrive_find_person(client, email=email, phone=phone)
+        if not person_id:
             result["status"] = "error"
-            result["error"] = "Pessoa não encontrada no Apollo"
-            logger.error("Pessoa não encontrada no Apollo: %s", identifier)
+            result["error"] = "Pessoa não encontrada no Pipedrive"
             return result
-        result["steps"]["apollo_person"] = "ok"
-        logger.info("Apollo person match: %s", person.get("name"))
+        result["steps"]["pipedrive_search"] = "ok"
 
-        # 2. Apollo — enriquecer organização
-        org_domain = person.get("organization", {}).get("primary_domain")
-        organization = None
-        if org_domain:
-            organization = await apollo_enrich_org(client, org_domain)
-            result["steps"]["apollo_org"] = "ok" if organization else "skipped"
+        person_name = pipedrive_person.get("name", "")
+        org_name = pipedrive_person.get("organization", {}).get("name", "") if pipedrive_person.get("organization") else ""
+        logger.info("Pipedrive: %s (%s)", person_name, org_name)
+
+        # 2. Apify Google Search — encontrar LinkedIn da pessoa
+        search_query = f"{person_name} {org_name} site:linkedin.com/in"
+        linkedin_url = await apify_google_search(client, search_query)
+        result["steps"]["google_search"] = "ok" if linkedin_url else "not_found"
+
+        # 3. Apify LinkedIn Profile — dados da pessoa
+        linkedin_person = None
+        if linkedin_url:
+            linkedin_person = await apify_linkedin_profile(client, linkedin_url)
+            result["steps"]["linkedin_profile"] = "ok" if linkedin_person else "failed"
         else:
-            result["steps"]["apollo_org"] = "skipped"
+            result["steps"]["linkedin_profile"] = "skipped"
 
-        # 3. Apollo — buscar funcionários
-        org_id = None
-        if organization:
-            org_id = organization.get("id")
-        elif person.get("organization", {}).get("id"):
-            org_id = person["organization"]["id"]
-
-        employees = []
-        if org_id:
-            employees = await apollo_search_people(client, org_id)
-            result["steps"]["apollo_employees"] = f"found {len(employees)}"
+        # 4. Apify LinkedIn Company — dados da empresa
+        linkedin_company = None
+        company_linkedin_url = None
+        if linkedin_person:
+            company_linkedin_url = linkedin_person.get("companyUrl") or linkedin_person.get("companyLinkedInUrl")
+        if company_linkedin_url:
+            linkedin_company = await apify_linkedin_company(client, company_linkedin_url)
+            result["steps"]["linkedin_company"] = "ok" if linkedin_company else "failed"
         else:
-            result["steps"]["apollo_employees"] = "skipped"
+            result["steps"]["linkedin_company"] = "skipped"
 
-        # 4. Firecrawl — scraping do site
+        # 5. Firecrawl — scraping do site da empresa
         website_content = None
-        website_url = organization.get("website_url") if organization else None
+        website_url = None
+        if linkedin_company:
+            website_url = linkedin_company.get("website")
         if website_url:
             website_content = await firecrawl_scrape(client, website_url)
             result["steps"]["firecrawl"] = "ok" if website_content else "failed"
         else:
             result["steps"]["firecrawl"] = "skipped"
 
-        # 5. Perplexity — pesquisa de mercado
+        # 6. Perplexity — pesquisa de mercado
         market_research = None
-        company_name = organization.get("name") if organization else person.get("organization", {}).get("name")
-        industry = organization.get("industry") if organization else ""
+        company_name = org_name or (linkedin_company.get("name") if linkedin_company else None)
+        industry = linkedin_company.get("industry", "") if linkedin_company else ""
         if company_name:
-            market_research = await perplexity_research(client, company_name, industry or "")
+            market_research = await perplexity_research(client, company_name, industry)
             result["steps"]["perplexity"] = "ok" if market_research else "failed"
         else:
             result["steps"]["perplexity"] = "skipped"
 
-        # 6. Claude — gerar resumo
-        summary = await claude_generate_summary(person, organization, employees, website_content, market_research)
+        # 7. Claude — gerar resumo
+        summary = await claude_generate_summary(linkedin_person, linkedin_company, website_content, market_research)
         if not summary:
             result["status"] = "partial"
             result["error"] = "Claude não gerou resumo"
             return result
         result["steps"]["claude"] = "ok"
 
-        # 7. Pipedrive — buscar pessoa e criar nota
-        person_id = await pipedrive_find_person(client, email=email, phone=phone)
-        if person_id:
-            note_created = await pipedrive_create_note(client, person_id, summary)
-            result["steps"]["pipedrive"] = "ok" if note_created else "failed"
-        else:
-            result["steps"]["pipedrive"] = "person_not_found"
+        # 8. Pipedrive — criar nota
+        note_created = await pipedrive_create_note(client, person_id, summary)
+        result["steps"]["pipedrive_note"] = "ok" if note_created else "failed"
 
     result["status"] = "completed"
     result["summary"] = summary
-    logger.info("Enriquecimento concluído para: %s", email)
+    logger.info("Enriquecimento concluído para: %s", identifier)
     return result
 
 
