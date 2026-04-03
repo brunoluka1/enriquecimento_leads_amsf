@@ -32,20 +32,23 @@ class EnrichRequest(BaseModel):
 
 async def apollo_match_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> dict | None:
     """Busca pessoa no Apollo pelo email ou telefone."""
-    payload = {"reveal_personal_emails": True}
+    payload = {"per_page": 1, "page": 1}
     if email:
-        payload["email"] = email
+        payload["q_keywords"] = email
     if phone:
-        payload["phone_number"] = phone
+        payload["q_keywords"] = phone
     resp = await client.post(
-        "https://api.apollo.io/v1/people/match",
+        "https://api.apollo.io/v1/mixed_people/search",
         headers={"Content-Type": "application/json", "x-api-key": APOLLO_API_KEY},
         json=payload,
     )
-    logger.info("Apollo person match status=%s response=%s", resp.status_code, resp.text[:1000])
+    logger.info("Apollo person search status=%s response=%s", resp.status_code, resp.text[:1000])
     if resp.status_code != 200:
         return None
-    return resp.json().get("person")
+    people = resp.json().get("people", [])
+    if not people:
+        return None
+    return people[0]
 
 
 async def apollo_enrich_org(client: httpx.AsyncClient, domain: str) -> dict | None:
