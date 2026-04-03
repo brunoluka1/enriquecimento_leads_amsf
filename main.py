@@ -42,8 +42,8 @@ async def apollo_match_person(client: httpx.AsyncClient, email: str | None = Non
         headers={"Content-Type": "application/json", "x-api-key": APOLLO_API_KEY},
         json=payload,
     )
+    logger.info("Apollo person match status=%s response=%s", resp.status_code, resp.text[:1000])
     if resp.status_code != 200:
-        logger.warning("Apollo person match falhou: %s", resp.text)
         return None
     return resp.json().get("person")
 
