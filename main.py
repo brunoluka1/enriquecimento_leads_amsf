@@ -24,17 +24,23 @@ PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")
 # ── Modelos ──────────────────────────────────────────────────────────────────
 
 class EnrichRequest(BaseModel):
-    email: str
+    email: str | None = None
+    phone: str | None = None
 
 
 # ── Apollo ───────────────────────────────────────────────────────────────────
 
-async def apollo_match_person(client: httpx.AsyncClient, email: str) -> dict | None:
-    """Busca pessoa no Apollo pelo email."""
+async def apollo_match_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> dict | None:
+    """Busca pessoa no Apollo pelo email ou telefone."""
+    payload = {"reveal_personal_emails": True}
+    if email:
+        payload["email"] = email
+    if phone:
+        payload["phone_number"] = phone
     resp = await client.post(
         "https://api.apollo.io/v1/people/match",
         headers={"Content-Type": "application/json", "x-api-key": APOLLO_API_KEY},
-        json={"email": email, "reveal_personal_emails": True},
+        json=payload,
     )
     if resp.status_code != 200:
         logger.warning("Apollo person match falhou: %s", resp.text)
@@ -224,13 +230,15 @@ Toda a resposta em português."""
 PIPEDRIVE_BASE = "https://api.pipedrive.com/v1"
 
 
-async def pipedrive_find_person(client: httpx.AsyncClient, email: str) -> int | None:
-    """Busca pessoa no Pipedrive pelo email."""
+async def pipedrive_find_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> int | None:
+    """Busca pessoa no Pipedrive pelo email ou telefone."""
+    term = email or phone
+    field = "email" if email else "phone"
     resp = await client.get(
         f"{PIPEDRIVE_BASE}/persons/search",
         params={
-            "term": email,
-            "fields": "email",
+            "term": term,
+            "fields": field,
             "exact_match": "true",
             "limit": 1,
             "api_token": PIPEDRIVE_API_TOKEN,
@@ -242,7 +250,7 @@ async def pipedrive_find_person(client: httpx.AsyncClient, email: str) -> int | 
     data = resp.json().get("data", {})
     items = data.get("items", [])
     if not items:
-        logger.warning("Pessoa não encontrada no Pipedrive: %s", email)
+        logger.warning("Pessoa não encontrada no Pipedrive: %s", term)
         return None
     return items[0].get("item", {}).get("id")
 
@@ -263,18 +271,19 @@ async def pipedrive_create_note(client: httpx.AsyncClient, person_id: int, conte
 
 # ── Fluxo Principal ─────────────────────────────────────────────────────────
 
-async def enrich_lead(email: str) -> dict:
+async def enrich_lead(email: str | None = None, phone: str | None = None) -> dict:
     """Executa o fluxo completo de enriquecimento."""
-    logger.info("Iniciando enriquecimento para: %s", email)
-    result = {"email": email, "status": "processing", "steps": {}}
+    identifier = email or phone
+    logger.info("Iniciando enriquecimento para: %s", identifier)
+    result = {"email": email, "phone": phone, "status": "processing", "steps": {}}
 
     async with httpx.AsyncClient(timeout=60) as client:
         # 1. Apollo — buscar pessoa
-        person = await apollo_match_person(client, email)
+        person = await apollo_match_person(client, email=email, phone=phone)
         if not person:
             result["status"] = "error"
             result["error"] = "Pessoa não encontrada no Apollo"
-            logger.error("Pessoa não encontrada no Apollo: %s", email)
+            logger.error("Pessoa não encontrada no Apollo: %s", identifier)
             return result
         result["steps"]["apollo_person"] = "ok"
         logger.info("Apollo person match: %s", person.get("name"))
@@ -330,7 +339,7 @@ async def enrich_lead(email: str) -> dict:
         result["steps"]["claude"] = "ok"
 
         # 7. Pipedrive — buscar pessoa e criar nota
-        person_id = await pipedrive_find_person(client, email)
+        person_id = await pipedrive_find_person(client, email=email, phone=phone)
         if person_id:
             note_created = await pipedrive_create_note(client, person_id, summary)
             result["steps"]["pipedrive"] = "ok" if note_created else "failed"
@@ -355,8 +364,10 @@ async def health():
 
 @app.post("/enrich")
 async def enrich_manual(req: EnrichRequest):
-    """Endpoint manual — envia email e recebe resultado."""
-    result = await enrich_lead(req.email)
+    """Endpoint manual — envia email ou telefone e recebe resultado."""
+    if not req.email and not req.phone:
+        return {"status": "error", "error": "Informe email ou phone"}
+    result = await enrich_lead(email=req.email, phone=req.phone)
     return result
 
 
@@ -368,19 +379,27 @@ async def webhook_pipedrive(request: Request, background_tasks: BackgroundTasks)
     # Pipedrive envia webhooks com estrutura: { "current": { ... }, "event": "..." }
     current = body.get("current", {})
 
-    # Extrair email do payload do Pipedrive
+    # Extrair email e/ou telefone do payload do Pipedrive
     email = None
+    phone = None
+
     email_data = current.get("email", [])
     if isinstance(email_data, list) and email_data:
         email = email_data[0].get("value")
     elif isinstance(email_data, str):
         email = email_data
 
-    if not email:
-        return {"status": "skipped", "reason": "no email found in payload"}
+    phone_data = current.get("phone", [])
+    if isinstance(phone_data, list) and phone_data:
+        phone = phone_data[0].get("value")
+    elif isinstance(phone_data, str):
+        phone = phone_data
 
-    background_tasks.add_task(enrich_lead, email)
-    return {"status": "accepted", "email": email}
+    if not email and not phone:
+        return {"status": "skipped", "reason": "no email or phone found in payload"}
+
+    background_tasks.add_task(enrich_lead, email=email, phone=phone)
+    return {"status": "accepted", "email": email, "phone": phone}
 
 
 if __name__ == "__main__":
