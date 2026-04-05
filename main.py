@@ -89,8 +89,9 @@ async def apify_run_actor(client: httpx.AsyncClient, actor_id: str, run_input: d
     return items_resp.json()
 
 
-async def apify_google_search(client: httpx.AsyncClient, query: str) -> str | None:
-    """Busca no Google via Apify para encontrar o LinkedIn da pessoa."""
+async def apify_google_search_query(client: httpx.AsyncClient, query: str) -> str | None:
+    """Executa uma busca no Google via Apify e retorna a primeira URL do LinkedIn encontrada."""
+    logger.info("Google Search query: %s", query)
     results = await apify_run_actor(client, "apify~google-search-scraper", {
         "queries": query,
         "maxPagesPerQuery": 1,
@@ -100,7 +101,6 @@ async def apify_google_search(client: httpx.AsyncClient, query: str) -> str | No
     if not results:
         return None
 
-    # Procurar URL do LinkedIn nos resultados
     for result in results:
         organic = result.get("organicResults", [])
         for item in organic:
@@ -108,6 +108,42 @@ async def apify_google_search(client: httpx.AsyncClient, query: str) -> str | No
             if "linkedin.com/in/" in url:
                 logger.info("LinkedIn encontrado via Google: %s", url)
                 return url
+    return None
+
+
+async def apify_find_linkedin(
+    client: httpx.AsyncClient,
+    email: str | None = None,
+    phone: str | None = None,
+    name: str | None = None,
+    company: str | None = None,
+) -> str | None:
+    """Tenta encontrar o LinkedIn da pessoa por email, telefone ou nome (nessa ordem de prioridade)."""
+
+    # 1. Buscar pelo email (mais confiável)
+    if email:
+        url = await apify_google_search_query(client, f'"{email}" site:linkedin.com/in')
+        if url:
+            return url
+
+    # 2. Buscar pelo telefone
+    if phone:
+        url = await apify_google_search_query(client, f'"{phone}" site:linkedin.com/in')
+        if url:
+            return url
+
+    # 3. Fallback: buscar pelo nome + empresa
+    if name and company:
+        url = await apify_google_search_query(client, f"{name} {company} site:linkedin.com/in")
+        if url:
+            return url
+
+    # 4. Último recurso: só o nome
+    if name:
+        url = await apify_google_search_query(client, f"{name} site:linkedin.com/in")
+        if url:
+            return url
+
     return None
 
 
@@ -359,9 +395,10 @@ async def enrich_lead(email: str | None = None, phone: str | None = None) -> dic
         org_name = pipedrive_person.get("organization", {}).get("name", "") if pipedrive_person.get("organization") else ""
         logger.info("Pipedrive: %s (%s)", person_name, org_name)
 
-        # 2. Apify Google Search — encontrar LinkedIn da pessoa
-        search_query = f"{person_name} {org_name} site:linkedin.com/in"
-        linkedin_url = await apify_google_search(client, search_query)
+        # 2. Apify Google Search — encontrar LinkedIn da pessoa (prioriza email/telefone)
+        linkedin_url = await apify_find_linkedin(
+            client, email=email, phone=phone, name=person_name, company=org_name,
+        )
         result["steps"]["google_search"] = "ok" if linkedin_url else "not_found"
 
         # 3. Apify LinkedIn Profile — dados da pessoa
