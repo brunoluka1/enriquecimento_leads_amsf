@@ -13,13 +13,13 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-APOLLO_API_KEY = os.getenv("APOLLO_API_KEY")
+PROXYCURL_API_KEY = os.getenv("PROXYCURL_API_KEY")
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")
 
-APOLLO_BASE = "https://api.apollo.io/api/v1"
+PROXYCURL_BASE = "https://nubela.co/proxycurl"
 
 
 # ── Modelos ──────────────────────────────────────────────────────────────────
@@ -31,41 +31,88 @@ class EnrichRequest(BaseModel):
     company: str | None = None
 
 
-# ── Apollo ──────────────────────────────────────────────────────────────────
+# ── Proxycurl ───────────────────────────────────────────────────────────────
 
-async def apollo_enrich_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> tuple[dict | None, dict | None]:
-    """Enriquece dados da pessoa via Apollo /people/match. Retorna (person, organization)."""
-    payload = {}
-    if email:
-        payload["email"] = email
-    if phone:
-        payload["phone_number"] = phone
+def _proxycurl_headers() -> dict:
+    return {"Authorization": f"Bearer {PROXYCURL_API_KEY}"}
 
-    resp = await client.post(
-        f"{APOLLO_BASE}/people/match",
-        headers={"Content-Type": "application/json", "X-Api-Key": APOLLO_API_KEY},
-        json=payload,
+
+async def proxycurl_resolve_email(client: httpx.AsyncClient, email: str) -> str | None:
+    """Busca o perfil LinkedIn a partir do email via Proxycurl. Retorna a URL do perfil."""
+    resp = await client.get(
+        f"{PROXYCURL_BASE}/api/linkedin/profile/resolve/email",
+        headers=_proxycurl_headers(),
+        params={"email": email, "lookup_depth": "superficial"},
         timeout=30,
     )
-    logger.info("Apollo /people/match status=%s", resp.status_code)
-
+    logger.info("Proxycurl resolve email status=%s", resp.status_code)
     if resp.status_code != 200:
-        logger.warning("Apollo falhou: %s", resp.text[:500])
-        return None, None
+        logger.warning("Proxycurl resolve email falhou: %s", resp.text[:500])
+        return None
 
     data = resp.json()
-    person = data.get("person")
-    organization = person.get("organization") if person else None
-
-    if person:
-        logger.info("Apollo person: %s — %s @ %s",
-                     person.get("name", "N/A"),
-                     person.get("title", "N/A"),
-                     organization.get("name", "N/A") if organization else "N/A")
+    linkedin_url = data.get("url")
+    if linkedin_url:
+        logger.info("Proxycurl encontrou LinkedIn: %s", linkedin_url)
     else:
-        logger.warning("Apollo não encontrou pessoa para: %s", email or phone)
+        logger.warning("Proxycurl não encontrou LinkedIn para: %s", email)
+    return linkedin_url
 
-    return person, organization
+
+async def proxycurl_resolve_phone(client: httpx.AsyncClient, phone: str) -> str | None:
+    """Busca o perfil LinkedIn a partir do telefone via Proxycurl."""
+    resp = await client.get(
+        f"{PROXYCURL_BASE}/api/resolve/phone",
+        headers=_proxycurl_headers(),
+        params={"phone_number": phone},
+        timeout=30,
+    )
+    logger.info("Proxycurl resolve phone status=%s", resp.status_code)
+    if resp.status_code != 200:
+        logger.warning("Proxycurl resolve phone falhou: %s", resp.text[:500])
+        return None
+
+    data = resp.json()
+    linkedin_url = data.get("url")
+    if linkedin_url:
+        logger.info("Proxycurl encontrou LinkedIn por telefone: %s", linkedin_url)
+    return linkedin_url
+
+
+async def proxycurl_person_profile(client: httpx.AsyncClient, linkedin_url: str) -> dict | None:
+    """Busca dados completos do perfil LinkedIn via Proxycurl."""
+    resp = await client.get(
+        f"{PROXYCURL_BASE}/api/v2/linkedin",
+        headers=_proxycurl_headers(),
+        params={"linkedin_profile_url": linkedin_url, "skills": "include"},
+        timeout=30,
+    )
+    logger.info("Proxycurl person profile status=%s", resp.status_code)
+    if resp.status_code != 200:
+        logger.warning("Proxycurl person profile falhou: %s", resp.text[:500])
+        return None
+
+    person = resp.json()
+    logger.info("Proxycurl person: %s — %s", person.get("full_name", "N/A"), person.get("headline", "N/A"))
+    return person
+
+
+async def proxycurl_company_profile(client: httpx.AsyncClient, linkedin_url: str) -> dict | None:
+    """Busca dados da empresa no LinkedIn via Proxycurl."""
+    resp = await client.get(
+        f"{PROXYCURL_BASE}/api/linkedin/company",
+        headers=_proxycurl_headers(),
+        params={"url": linkedin_url},
+        timeout=30,
+    )
+    logger.info("Proxycurl company profile status=%s", resp.status_code)
+    if resp.status_code != 200:
+        logger.warning("Proxycurl company profile falhou: %s", resp.text[:500])
+        return None
+
+    company = resp.json()
+    logger.info("Proxycurl company: %s — %s", company.get("name", "N/A"), company.get("industry", "N/A"))
+    return company
 
 
 # ── Firecrawl ────────────────────────────────────────────────────────────────
@@ -171,39 +218,45 @@ async def claude_generate_summary(
 ) -> str | None:
     """Gera resumo de enriquecimento do lead usando Claude."""
 
-    # Dados da pessoa (Apollo)
+    # Dados da pessoa (Proxycurl/LinkedIn)
     person_text = "Não disponível"
     if person:
-        person_text = f"""Nome: {person.get('name', 'N/A')}
-Email: {person.get('email', 'N/A')}
-LinkedIn: {person.get('linkedin_url', 'N/A')}
-Cargo: {person.get('title', 'N/A')}
-Headline: {person.get('headline', 'N/A')}
-Localização: {person.get('city', '')}, {person.get('state', '')}, {person.get('country', '')}
-Senioridade: {person.get('seniority', 'N/A')}
-Departamento: {', '.join(person.get('departments', [])) if person.get('departments') else 'N/A'}"""
+        # Experiência atual
+        experiences = person.get("experiences", [])
+        current_exp = ""
+        if experiences:
+            exp = experiences[0]
+            current_exp = f"\nEmpresa atual: {exp.get('company', 'N/A')} — {exp.get('title', 'N/A')}"
+            if exp.get("description"):
+                current_exp += f"\nDescrição do cargo: {exp['description'][:500]}"
 
-    # Dados da empresa (Apollo)
+        person_text = f"""Nome: {person.get('full_name', 'N/A')}
+LinkedIn: {person.get('public_identifier', 'N/A')}
+Headline: {person.get('headline', 'N/A')}
+Localização: {person.get('city', '')}, {person.get('state', '')}, {person.get('country_full_name', '')}
+Resumo: {(person.get('summary') or 'N/A')[:800]}{current_exp}
+Skills: {', '.join(person.get('skills', [])[:15]) if person.get('skills') else 'N/A'}"""
+
+    # Dados da empresa (Proxycurl/LinkedIn)
     company_text = "Não disponível"
     if company:
         company_text = f"""Nome: {company.get('name', 'N/A')}
-Website: {company.get('website_url', 'N/A')}
+Website: {company.get('website', 'N/A')}
 Setor: {company.get('industry', 'N/A')}
-Subsetor: {company.get('sub_industry', 'N/A')}
-Tamanho: {company.get('estimated_num_employees', 'N/A')} funcionários
-Localização: {company.get('city', '')}, {company.get('state', '')}, {company.get('country', '')}
-Receita estimada: {company.get('annual_revenue_printed', 'N/A')}
-Descrição: {(company.get('short_description') or company.get('description') or 'N/A')[:1000]}
-LinkedIn: {company.get('linkedin_url', 'N/A')}
-Palavras-chave: {', '.join(company.get('keywords', [])[:10]) if company.get('keywords') else 'N/A'}
-Tecnologias: {', '.join(company.get('technology_names', [])[:15]) if company.get('technology_names') else 'N/A'}"""
+Tamanho: {company.get('company_size_on_linkedin', 'N/A')} funcionários
+Localização: {', '.join(filter(None, [company.get('city'), company.get('state'), company.get('country')]))}
+Descrição: {(company.get('description') or 'N/A')[:1000]}
+LinkedIn: {company.get('linkedin_internal_id', 'N/A')}
+Especialidades: {', '.join(company.get('specialities', [])[:10]) if company.get('specialities') else 'N/A'}
+Fundada em: {company.get('founded_year', 'N/A')}
+Tipo: {company.get('company_type', 'N/A')}"""
 
     prompt = f"""You are a B2B sales intelligence assistant. Analyze the following lead data and generate a concise lead enrichment summary for the CRM.
 
-## Lead Data (Apollo):
+## Lead Data (LinkedIn):
 {person_text}
 
-## Company Information (Apollo):
+## Company Information (LinkedIn):
 {company_text}
 
 ## Company Website Content (Firecrawl):
@@ -291,38 +344,63 @@ async def enrich_lead(email: str | None = None, phone: str | None = None) -> dic
         result["steps"]["pipedrive_search"] = "ok"
         logger.info("Pipedrive: person_id=%s", person_id)
 
-        # 2. Apollo — enriquecer dados da pessoa e empresa
-        apollo_person, apollo_org = await apollo_enrich_person(client, email=email, phone=phone)
-        result["steps"]["apollo"] = "ok" if apollo_person else "not_found"
+        # 2. Proxycurl — encontrar LinkedIn pelo email ou telefone
+        linkedin_url = None
+        if email:
+            linkedin_url = await proxycurl_resolve_email(client, email)
+        if not linkedin_url and phone:
+            linkedin_url = await proxycurl_resolve_phone(client, phone)
+        result["steps"]["proxycurl_resolve"] = "ok" if linkedin_url else "not_found"
 
-        # 3. Firecrawl — scraping do site da empresa
+        # 3. Proxycurl — dados do perfil LinkedIn
+        person_data = None
+        if linkedin_url:
+            person_data = await proxycurl_person_profile(client, linkedin_url)
+            result["steps"]["proxycurl_person"] = "ok" if person_data else "failed"
+        else:
+            result["steps"]["proxycurl_person"] = "skipped"
+
+        # 4. Proxycurl — dados da empresa no LinkedIn
+        company_data = None
+        company_linkedin_url = None
+        if person_data:
+            experiences = person_data.get("experiences", [])
+            if experiences:
+                company_linkedin_url = experiences[0].get("company_linkedin_profile_url")
+        if company_linkedin_url:
+            company_data = await proxycurl_company_profile(client, company_linkedin_url)
+            result["steps"]["proxycurl_company"] = "ok" if company_data else "failed"
+        else:
+            result["steps"]["proxycurl_company"] = "skipped"
+
+        # 5. Firecrawl — scraping do site da empresa
         website_content = None
-        website_url = apollo_org.get("website_url") if apollo_org else None
+        website_url = company_data.get("website") if company_data else None
         if website_url:
             website_content = await firecrawl_scrape(client, website_url)
             result["steps"]["firecrawl"] = "ok" if website_content else "failed"
         else:
             result["steps"]["firecrawl"] = "skipped"
 
-        # 4. Perplexity — pesquisa de mercado
+        # 6. Perplexity — pesquisa de mercado
         market_research = None
-        company_name = apollo_org.get("name") if apollo_org else None
-        industry = apollo_org.get("industry", "") if apollo_org else ""
+        company_name = company_data.get("name") if company_data else None
+        industry = company_data.get("industry", "") if company_data else ""
         if company_name:
             market_research = await perplexity_research(client, company_name, industry)
             result["steps"]["perplexity"] = "ok" if market_research else "failed"
         else:
             result["steps"]["perplexity"] = "skipped"
 
-        # 5. Claude — gerar resumo
-        summary = await claude_generate_summary(apollo_person, apollo_org, website_content, market_research)
+        # 7. Claude — gerar resumo
+        summary = await claude_generate_summary(person_data, company_data, website_content, market_research)
         if not summary:
             result["status"] = "partial"
             result["error"] = "Claude não gerou resumo"
             return result
         result["steps"]["claude"] = "ok"
 
-        # 6. Pipedrive — criar nota
+        # 8. Pipedrive — criar nota
         note_created = await pipedrive_create_note(client, person_id, summary)
         result["steps"]["pipedrive_note"] = "ok" if note_created else "failed"
 
