@@ -354,6 +354,57 @@ async def enrich_manual(req: EnrichRequest):
     return result
 
 
+class TestRequest(BaseModel):
+    company_name: str
+    company_website: str | None = None
+    industry: str | None = None
+    person_name: str | None = None
+    person_title: str | None = None
+
+
+@app.post("/test")
+async def test_integrations(req: TestRequest):
+    """Endpoint de teste — testa Firecrawl, Perplexity e Claude sem Apollo."""
+    result = {"status": "processing", "steps": {}}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+
+        # 1. Firecrawl
+        website_content = None
+        if req.company_website:
+            website_content = await firecrawl_scrape(client, req.company_website)
+            result["steps"]["firecrawl"] = "ok" if website_content else "failed"
+        else:
+            result["steps"]["firecrawl"] = "skipped"
+
+        # 2. Perplexity
+        market_research = None
+        market_research = await perplexity_research(client, req.company_name, req.industry or "")
+        result["steps"]["perplexity"] = "ok" if market_research else "failed"
+
+        # 3. Claude — montar dados fake de pessoa/empresa pra testar
+        fake_person = None
+        if req.person_name:
+            fake_person = {
+                "name": req.person_name,
+                "title": req.person_title or "N/A",
+                "headline": req.person_title or "N/A",
+            }
+
+        fake_company = {
+            "name": req.company_name,
+            "website_url": req.company_website or "N/A",
+            "industry": req.industry or "N/A",
+        }
+
+        summary = await claude_generate_summary(fake_person, fake_company, website_content, market_research)
+        result["steps"]["claude"] = "ok" if summary else "failed"
+
+    result["status"] = "completed"
+    result["summary"] = summary
+    return result
+
+
 @app.post("/webhook/pipedrive")
 async def webhook_pipedrive(request: Request, background_tasks: BackgroundTasks):
     """Webhook do Pipedrive — dispara enriquecimento em background."""
