@@ -34,7 +34,7 @@ class EnrichRequest(BaseModel):
 # ── Apollo ──────────────────────────────────────────────────────────────────
 
 async def apollo_search_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> tuple[dict | None, dict | None]:
-    """Busca pessoa via Apollo Search API. Retorna (person, organization)."""
+    """Busca pessoa via Apollo /contacts/search. Retorna (person, organization)."""
     payload = {"per_page": 1, "page": 1}
     if email:
         payload["q_keywords"] = email
@@ -42,25 +42,26 @@ async def apollo_search_person(client: httpx.AsyncClient, email: str | None = No
         payload["q_keywords"] = phone
 
     resp = await client.post(
-        f"{APOLLO_BASE}/mixed_people/search",
+        f"{APOLLO_BASE}/contacts/search",
         headers={"Content-Type": "application/json", "X-Api-Key": APOLLO_API_KEY},
         json=payload,
         timeout=30,
     )
-    logger.info("Apollo /mixed_people/search status=%s", resp.status_code)
+    logger.info("Apollo /contacts/search status=%s", resp.status_code)
+    logger.info("Apollo response: %s", resp.text[:1000])
 
     if resp.status_code != 200:
         logger.warning("Apollo falhou: %s", resp.text[:500])
         return None, None
 
     data = resp.json()
-    people = data.get("people", [])
-    if not people:
+    contacts = data.get("contacts", [])
+    if not contacts:
         logger.warning("Apollo não encontrou pessoa para: %s", email or phone)
         return None, None
 
-    person = people[0]
-    organization = person.get("organization")
+    person = contacts[0]
+    organization = person.get("organization") or person.get("account")
 
     logger.info("Apollo person: %s — %s @ %s",
                  person.get("name", "N/A"),
