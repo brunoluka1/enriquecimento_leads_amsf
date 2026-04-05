@@ -35,7 +35,7 @@ class EnrichRequest(BaseModel):
 
 async def apollo_enrich_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> tuple[dict | None, dict | None]:
     """Enriquece dados da pessoa via Apollo /people/match. Retorna (person, organization)."""
-    payload = {"api_key": APOLLO_API_KEY}
+    payload = {}
     if email:
         payload["email"] = email
     if phone:
@@ -43,7 +43,7 @@ async def apollo_enrich_person(client: httpx.AsyncClient, email: str | None = No
 
     resp = await client.post(
         f"{APOLLO_BASE}/people/match",
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-Api-Key": APOLLO_API_KEY},
         json=payload,
         timeout=30,
     )
