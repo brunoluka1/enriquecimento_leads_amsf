@@ -149,24 +149,26 @@ async def apify_find_linkedin(
 
 async def apify_linkedin_profile(client: httpx.AsyncClient, linkedin_url: str) -> dict | None:
     """Scrape do perfil LinkedIn via Apify."""
-    results = await apify_run_actor(client, "anchor~linkedin-profile-scraper", {
-        "profileUrls": [linkedin_url],
+    results = await apify_run_actor(client, "harvestapi~linkedin-profile-scraper", {
+        "queries": [linkedin_url],
     })
     if not results or len(results) == 0:
         return None
-    logger.info("LinkedIn profile scraped: %s", results[0].get("fullName", "N/A"))
-    return results[0]
+    profile = results[0]
+    logger.info("LinkedIn profile scraped: %s (keys: %s)", profile.get("fullName") or profile.get("name", "N/A"), list(profile.keys())[:15])
+    return profile
 
 
 async def apify_linkedin_company(client: httpx.AsyncClient, company_url: str) -> dict | None:
     """Scrape da página da empresa no LinkedIn via Apify."""
-    results = await apify_run_actor(client, "anchor~linkedin-company-scraper", {
-        "companyUrls": [company_url],
+    results = await apify_run_actor(client, "harvestapi~linkedin-company", {
+        "companies": [company_url],
     })
     if not results or len(results) == 0:
         return None
-    logger.info("LinkedIn company scraped: %s", results[0].get("name", "N/A"))
-    return results[0]
+    company = results[0]
+    logger.info("LinkedIn company scraped: %s (keys: %s)", company.get("name", "N/A"), list(company.keys())[:15])
+    return company
 
 
 # ── Firecrawl ────────────────────────────────────────────────────────────────
