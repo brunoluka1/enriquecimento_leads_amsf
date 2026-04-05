@@ -96,7 +96,7 @@ async def apify_google_search_query(client: httpx.AsyncClient, query: str) -> st
         "queries": query,
         "maxPagesPerQuery": 1,
         "resultsPerPage": 5,
-        "languageCode": "pt",
+        "languageCode": "",
     })
     if not results:
         return None
