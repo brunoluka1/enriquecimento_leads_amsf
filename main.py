@@ -33,37 +33,39 @@ class EnrichRequest(BaseModel):
 
 # ── Apollo ──────────────────────────────────────────────────────────────────
 
-async def apollo_enrich_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> tuple[dict | None, dict | None]:
-    """Enriquece dados da pessoa via Apollo /people/match. Retorna (person, organization)."""
-    payload = {}
+async def apollo_search_person(client: httpx.AsyncClient, email: str | None = None, phone: str | None = None) -> tuple[dict | None, dict | None]:
+    """Busca pessoa via Apollo Search API. Retorna (person, organization)."""
+    payload = {"per_page": 1, "page": 1}
     if email:
-        payload["email"] = email
-    if phone:
-        payload["phone_number"] = phone
+        payload["q_keywords"] = email
+    elif phone:
+        payload["q_keywords"] = phone
 
     resp = await client.post(
-        f"{APOLLO_BASE}/people/match",
+        f"{APOLLO_BASE}/mixed_people/search",
         headers={"Content-Type": "application/json", "X-Api-Key": APOLLO_API_KEY},
         json=payload,
         timeout=30,
     )
-    logger.info("Apollo /people/match status=%s", resp.status_code)
+    logger.info("Apollo /mixed_people/search status=%s", resp.status_code)
 
     if resp.status_code != 200:
         logger.warning("Apollo falhou: %s", resp.text[:500])
         return None, None
 
     data = resp.json()
-    person = data.get("person")
-    organization = person.get("organization") if person else None
-
-    if person:
-        logger.info("Apollo person: %s — %s @ %s",
-                     person.get("name", "N/A"),
-                     person.get("title", "N/A"),
-                     organization.get("name", "N/A") if organization else "N/A")
-    else:
+    people = data.get("people", [])
+    if not people:
         logger.warning("Apollo não encontrou pessoa para: %s", email or phone)
+        return None, None
+
+    person = people[0]
+    organization = person.get("organization")
+
+    logger.info("Apollo person: %s — %s @ %s",
+                 person.get("name", "N/A"),
+                 person.get("title", "N/A"),
+                 organization.get("name", "N/A") if organization else "N/A")
 
     return person, organization
 
@@ -292,7 +294,7 @@ async def enrich_lead(email: str | None = None, phone: str | None = None) -> dic
         logger.info("Pipedrive: person_id=%s", person_id)
 
         # 2. Apollo — enriquecer dados da pessoa e empresa
-        apollo_person, apollo_org = await apollo_enrich_person(client, email=email, phone=phone)
+        apollo_person, apollo_org = await apollo_search_person(client, email=email, phone=phone)
         result["steps"]["apollo"] = "ok" if apollo_person else "not_found"
 
         # 3. Firecrawl — scraping do site da empresa
