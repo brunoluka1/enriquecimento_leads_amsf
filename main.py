@@ -111,6 +111,19 @@ async def apify_google_search_query(client: httpx.AsyncClient, query: str) -> st
     return None
 
 
+def _name_from_email(email: str) -> str | None:
+    """Extrai um nome provável a partir do email (ex: bruno.silva@x.com → bruno silva)."""
+    import re
+    local = email.split("@")[0]
+    # Substituir separadores comuns por espaço
+    name = re.sub(r"[._\-+]", " ", local)
+    # Remover números
+    name = re.sub(r"\d+", "", name).strip()
+    if len(name) < 3:
+        return None
+    return name
+
+
 async def apify_find_linkedin(
     client: httpx.AsyncClient,
     email: str | None = None,
@@ -118,27 +131,23 @@ async def apify_find_linkedin(
     name: str | None = None,
     company: str | None = None,
 ) -> str | None:
-    """Tenta encontrar o LinkedIn da pessoa por email, telefone ou nome (nessa ordem de prioridade)."""
+    """Tenta encontrar o LinkedIn da pessoa usando Google Search."""
 
-    # 1. Buscar pelo email (mais confiável)
+    # 1. Extrair nome do email e buscar no LinkedIn (mais confiável que nome do CRM)
     if email:
-        url = await apify_google_search_query(client, f'"{email}" site:linkedin.com/in')
-        if url:
-            return url
+        email_name = _name_from_email(email)
+        if email_name:
+            url = await apify_google_search_query(client, f'{email_name} site:linkedin.com/in')
+            if url:
+                return url
 
-    # 2. Buscar pelo telefone
-    if phone:
-        url = await apify_google_search_query(client, f'"{phone}" site:linkedin.com/in')
-        if url:
-            return url
-
-    # 3. Fallback: buscar pelo nome + empresa
+    # 2. Nome do CRM + empresa
     if name and company:
         url = await apify_google_search_query(client, f"{name} {company} site:linkedin.com/in")
         if url:
             return url
 
-    # 4. Último recurso: só o nome
+    # 3. Só o nome do CRM
     if name:
         url = await apify_google_search_query(client, f"{name} site:linkedin.com/in")
         if url:
